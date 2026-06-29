@@ -1,191 +1,141 @@
 #!/bin/bash
-# Sophos KBA-000043746 - macOS Recovery Mode tamper-protection fix
-# v4: fixed false "Locked" match where "Unlocked" was detected as locked.
 
 set -e
-
-if [[ "$1" == "--debug" ]]; then
-  set -x
-fi
 
 TS="$(date +%Y%m%d_%H%M%S)"
 LOGFILE="/tmp/sophos_recovery_${TS}.log"
 exec > >(tee -a "$LOGFILE") 2>&1
 
-log() { echo "[$(date '+%H:%M:%S')] $1"; }
+log() {
+  echo "[$(date '+%H:%M:%S')] $1"
+}
 
-trap 'log "[ERROR] Script failed at line $LINENO. Last command: $BASH_COMMAND"; log "Log saved at: $LOGFILE"; exit 1' ERR
+fail() {
+  echo ""
+  echo "ERROR: $1"
+  echo ""
+  echo "Take a photo of this screen and send it to IT."
+  echo "Log file: $LOGFILE"
+  exit 1
+}
 
-log "=== Sophos Tamper Recovery Script v4 starting ==="
+trap 'fail "Script stopped unexpectedly."' ERR
+
+clear
+echo "=================================================="
+echo " Sophos Removal Recovery Tool"
+echo "=================================================="
+echo ""
+echo "This tool prepares Sophos so it can be removed."
+echo ""
+echo "Important password note:"
+echo "When asked for a Passphrase, type your Mac admin"
+echo "password. Nothing will appear while typing."
+echo "That is normal. Press Return when done."
+echo ""
+echo "=================================================="
+echo ""
+
+log "Starting Sophos recovery script"
 log "Log file: $LOGFILE"
 
-echo ""
-echo "----- Environment -----"
-sw_vers || true
-echo ""
-diskutil list
-echo "------------------------"
-echo ""
+APFS_OUTPUT="$(diskutil apfs list)"
 
-log "== Scanning APFS volumes =="
-APFS_OUTPUT=$(diskutil apfs list)
-echo "$APFS_OUTPUT"
+DATA_COUNT="$(echo "$APFS_OUTPUT" | grep -cE "\(Data\)")"
 
-DATA_COUNT=$(echo "$APFS_OUTPUT" | grep -cE "\(Data\)")
-log "Found $DATA_COUNT volume(s) tagged (Data)"
-
-DATAVOL=""
-FV_RAW=""
-
-if [ "$DATA_COUNT" -eq 1 ]; then
-  DETECTED=$(echo "$APFS_OUTPUT" | awk '
-    /\(Data\)/ {
-      for (i=1;i<=NF;i++) if ($i ~ /^disk[0-9]+s[0-9]+$/) id=$i
-      collecting=1
-      next
-    }
-    collecting && /FileVault:/ {
-      line=$0
-      sub(/^[ \t]*FileVault:[ \t]*/, "", line)
-      print id "|" line
-      collecting=0
-      exit
-    }
-  ')
-
-  DATAVOL="${DETECTED%%|*}"
-  FV_RAW="${DETECTED#*|}"
-
-  log "Auto-detected Data volume: $DATAVOL"
-  log "FileVault status: $FV_RAW"
-
-  read -p "Does this look correct? [Y/n]: " CONFIRM
-  log "User confirmation response: $CONFIRM"
-
-  if [[ "$CONFIRM" =~ ^[Nn]$ ]]; then
-    DATA_COUNT=0
-    DATAVOL=""
-  fi
-fi
-
-if [ "$DATA_COUNT" -ne 1 ] || [ -z "$DATAVOL" ]; then
-  log "Falling back to manual identification"
+if [ "$DATA_COUNT" -ne 1 ]; then
   echo "$APFS_OUTPUT"
-  echo ""
-  echo "Find the line: APFS Volume Disk (Role): <disk-identifier> (Data)"
-  echo "It must be the (Data) role - NOT the Container line at the top of each block."
-
-  read -p "Enter that Data volume's disk identifier exactly as shown, e.g. disk3s5: " DATAVOL
-  log "User-entered disk identifier: $DATAVOL"
-
-  FV_RAW=$(echo "$APFS_OUTPUT" | grep -A 12 "$DATAVOL" | grep "FileVault:" | head -1)
-  log "FileVault status detected: ${FV_RAW:-could not determine - check manually above}"
+  fail "Could not safely auto-detect exactly one Data volume."
 fi
 
-LOCKED="no"
+DETECTED="$(echo "$APFS_OUTPUT" | awk '
+  /\(Data\)/ {
+    for (i=1;i<=NF;i++) {
+      if ($i ~ /^disk[0-9]+s[0-9]+$/) id=$i
+    }
+    collecting=1
+    next
+  }
+  collecting && /FileVault:/ {
+    line=$0
+    sub(/^[ \t]*FileVault:[ \t]*/, "", line)
+    print id "|" line
+    collecting=0
+    exit
+  }
+')"
 
-# Important: match only the actual locked state.
-# Do NOT grep for plain "Locked", because "Unlocked" contains "Locked".
+DATAVOL="${DETECTED%%|*}"
+FV_RAW="${DETECTED#*|}"
+
+[ -n "$DATAVOL" ] || fail "Could not identify the Data volume."
+
+log "Detected Data volume: $DATAVOL"
+log "Detected FileVault status: $FV_RAW"
+
 if echo "$FV_RAW" | grep -qi "Yes *(Locked)"; then
-  LOCKED="yes"
+  echo ""
+  echo "The Mac's Data volume is locked by FileVault."
+  echo ""
+  echo "At the Passphrase prompt:"
+  echo "  1. Type the Mac admin password"
+  echo "  2. Nothing will show while typing"
+  echo "  3. Press Return"
+  echo ""
+
+  diskutil apfs unlockVolume "$DATAVOL" || fail "Could not unlock the Data volume. The password may have been blank or incorrect."
 fi
 
-log "Locked status: $LOCKED"
-
-if [ "$LOCKED" == "yes" ]; then
-  ATTEMPT=1
-
-  while true; do
-    log "== Unlock attempt #$ATTEMPT for $DATAVOL =="
-    echo "You'll be prompted for a password - use the ADMINISTRATOR password."
-
-    if ! diskutil apfs unlockVolume "$DATAVOL"; then
-      CURRENT_MOUNT=$(diskutil info "$DATAVOL" | awk -F': +' '/Mount Point/{print $2}')
-
-      if [[ -n "$CURRENT_MOUNT" && "$CURRENT_MOUNT" != "Not Mounted" && "$CURRENT_MOUNT" != "Not applicable"* ]]; then
-        log "Volume already appears unlocked/mounted at: $CURRENT_MOUNT"
-        break
-      else
-        log "[ERROR] Unlock failed and volume does not appear mounted."
-        exit 1
-      fi
-    fi
-
-    NEW_STATUS=$(diskutil apfs list | grep -A 12 "$DATAVOL" | grep "FileVault:" | head -1)
-    log "Status after unlock attempt #$ATTEMPT: $NEW_STATUS"
-
-    if echo "$NEW_STATUS" | grep -qi "Yes *(Locked)"; then
-      log "Still locked after attempt #$ATTEMPT - retrying per KB steps 7-8."
-      log "If this repeats, the admin password may not be the FileVault-authorized user."
-      ATTEMPT=$((ATTEMPT+1))
-      continue
-    else
-      log "Unlock succeeded after $ATTEMPT attempt(s)."
-      break
-    fi
-  done
-fi
-
-log "== Mounting $DATAVOL =="
-
-CURRENT_MOUNT=$(diskutil info "$DATAVOL" | awk -F': +' '/Mount Point/{print $2}')
-log "Mount point before action: '$CURRENT_MOUNT'"
+CURRENT_MOUNT="$(diskutil info "$DATAVOL" | awk -F': +' '/Mount Point/{print $2}')"
 
 if [[ -z "$CURRENT_MOUNT" || "$CURRENT_MOUNT" == "Not Mounted" || "$CURRENT_MOUNT" == "Not applicable"* ]]; then
-  log "Not currently mounted - mounting now."
-  diskutil mount "$DATAVOL"
-  CURRENT_MOUNT=$(diskutil info "$DATAVOL" | awk -F': +' '/Mount Point/{print $2}')
-else
-  log "Already mounted - skipping explicit mount."
+  log "Mounting Data volume"
+  diskutil mount "$DATAVOL" || fail "Could not mount the Data volume."
+  CURRENT_MOUNT="$(diskutil info "$DATAVOL" | awk -F': +' '/Mount Point/{print $2}')"
 fi
 
-log "Mount point: $CURRENT_MOUNT"
+[ -n "$CURRENT_MOUNT" ] || fail "Could not determine the Data volume mount point."
 
-if [[ -z "$CURRENT_MOUNT" || "$CURRENT_MOUNT" == "Not Mounted" || "$CURRENT_MOUNT" == "Not applicable"* ]]; then
-  log "[ERROR] Could not determine a valid mount point for $DATAVOL."
-  exit 1
-fi
+log "Data volume mounted at: $CURRENT_MOUNT"
 
 SOPHOS_PLIST="$CURRENT_MOUNT/Library/Sophos Anti-Virus/product-info.plist"
-log "Expected plist path: $SOPHOS_PLIST"
 
 if [ ! -f "$SOPHOS_PLIST" ]; then
-  log "[ERROR] Could not find: $SOPHOS_PLIST"
-  log "Double-check the mount point above against the KB article before continuing."
-  log "Directory listing of $CURRENT_MOUNT/Library, if accessible:"
-  ls -la "$CURRENT_MOUNT/Library" 2>&1 | head -30 || true
-  exit 1
+  fail "Could not find the Sophos product-info.plist file."
 fi
 
-log "Found plist. Backing up and patching."
+log "Found Sophos plist: $SOPHOS_PLIST"
 
 BACKUP="$SOPHOS_PLIST.bak.${TS}"
-cp "$SOPHOS_PLIST" "$BACKUP"
-log "Backup saved: $BACKUP"
+cp "$SOPHOS_PLIST" "$BACKUP" || fail "Could not back up the Sophos plist."
+
+log "Backup created: $BACKUP"
 
 if plutil -p "$SOPHOS_PLIST" | grep -q '"HomeVersion"'; then
-  log "HomeVersion already exists - replacing value."
   plutil -replace "HomeVersion" -string "10.7.3" "$SOPHOS_PLIST"
 else
-  log "HomeVersion does not exist - inserting value."
   plutil -insert "HomeVersion" -string "10.7.3" "$SOPHOS_PLIST"
 fi
 
-log "Patch applied. Verifying:"
-plutil -p "$SOPHOS_PLIST" | grep -i HomeVersion || log "[WARN] Could not verify HomeVersion key after patch."
+VERIFY="$(plutil -p "$SOPHOS_PLIST" | grep -i HomeVersion || true)"
 
-PERSIST_LOG="$CURRENT_MOUNT/Library/sophos_recovery_${TS}.log"
-cp "$LOGFILE" "$PERSIST_LOG" 2>/dev/null && log "Log also copied to: $PERSIST_LOG" || log "[WARN] Could not copy log to Data volume."
-
-log "=== Done ==="
-
+echo ""
+echo "=================================================="
+echo " SUCCESS"
+echo "=================================================="
+echo ""
+echo "Sophos is now prepared for removal."
 echo ""
 echo "Next steps:"
-echo "  1. Restart into normal macOS."
-echo "  2. Run Remove Sophos Anti-Virus or the Sophos Removal Tool."
-echo "  3. Use the administrator password when prompted."
-echo "  4. Reinstall Sophos if needed."
+echo "1. Restart the Mac normally."
+echo "2. Open Remove Sophos Endpoint."
+echo "3. When prompted, enter the Mac admin password."
 echo ""
-echo "Troubleshooting logs:"
-echo "  $LOGFILE"
-echo "  $PERSIST_LOG"
+echo "Verification:"
+echo "$VERIFY"
+echo ""
+
+PERSIST_LOG="$CURRENT_MOUNT/Library/sophos_recovery_${TS}.log"
+cp "$LOGFILE" "$PERSIST_LOG" 2>/dev/null || true
+
+log "Completed successfully"
