@@ -1,6 +1,6 @@
 #!/bin/bash
 # Sophos KBA-000043746 - macOS Recovery Mode tamper-protection fix
-# v4: fixed false "Locked" match where "Unlocked" was detected as locked.
+# v5: adds fallback search for Sophos product-info.plist.
 
 set -e
 
@@ -16,7 +16,7 @@ log() { echo "[$(date '+%H:%M:%S')] $1"; }
 
 trap 'log "[ERROR] Script failed at line $LINENO. Last command: $BASH_COMMAND"; log "Log saved at: $LOGFILE"; exit 1' ERR
 
-log "=== Sophos Tamper Recovery Script v4 starting ==="
+log "=== Sophos Tamper Recovery Script v5 starting ==="
 log "Log file: $LOGFILE"
 
 echo ""
@@ -84,8 +84,6 @@ fi
 
 LOCKED="no"
 
-# Important: match only the actual locked state.
-# Do NOT grep for plain "Locked", because "Unlocked" contains "Locked".
 if echo "$FV_RAW" | grep -qi "Yes *(Locked)"; then
   LOCKED="yes"
 fi
@@ -97,7 +95,12 @@ if [ "$LOCKED" == "yes" ]; then
 
   while true; do
     log "== Unlock attempt #$ATTEMPT for $DATAVOL =="
-    echo "You'll be prompted for a password - use the ADMINISTRATOR password."
+    echo ""
+    echo "IMPORTANT:"
+    echo "Type the Mac administrator password at the Passphrase prompt."
+    echo "Nothing will appear while typing. This is normal."
+    echo "Press Return when finished."
+    echo ""
 
     if ! diskutil apfs unlockVolume "$DATAVOL"; then
       CURRENT_MOUNT=$(diskutil info "$DATAVOL" | awk -F': +' '/Mount Point/{print $2}')
@@ -150,11 +153,25 @@ SOPHOS_PLIST="$CURRENT_MOUNT/Library/Sophos Anti-Virus/product-info.plist"
 log "Expected plist path: $SOPHOS_PLIST"
 
 if [ ! -f "$SOPHOS_PLIST" ]; then
-  log "[ERROR] Could not find: $SOPHOS_PLIST"
-  log "Double-check the mount point above against the KB article before continuing."
-  log "Directory listing of $CURRENT_MOUNT/Library, if accessible:"
-  ls -la "$CURRENT_MOUNT/Library" 2>&1 | head -30 || true
-  exit 1
+  log "Expected plist was not found. Searching for Sophos product-info.plist elsewhere on the Data volume."
+
+  SOPHOS_PLIST=$(find "$CURRENT_MOUNT" \
+    -type f \
+    -name "product-info.plist" \
+    -path "*Sophos*" \
+    2>/dev/null | head -1)
+
+  if [ -n "$SOPHOS_PLIST" ] && [ -f "$SOPHOS_PLIST" ]; then
+    log "Found alternate Sophos plist: $SOPHOS_PLIST"
+  else
+    log "[ERROR] Could not find any Sophos product-info.plist on the mounted Data volume."
+    log "This Mac may have a newer Sophos Endpoint layout, a partial/corrupt install, or Sophos may already be partially removed."
+    log "Directory listing of $CURRENT_MOUNT/Library, if accessible:"
+    ls -la "$CURRENT_MOUNT/Library" 2>&1 | head -60 || true
+    echo ""
+    echo "Take a photo of this screen and send it to IT."
+    exit 1
+  fi
 fi
 
 log "Found plist. Backing up and patching."
